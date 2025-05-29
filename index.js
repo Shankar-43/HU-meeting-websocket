@@ -3,28 +3,57 @@ const http = require("http");
 const { Server } = require("socket.io");
 
 const app = express();
+
+// Add basic middleware for deployment
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Health check endpoint
 app.get("/", (req, res) => {
-  res.send("WebSocket server is running.");
+  res.json({
+    status: "WebSocket server is running",
+    timestamp: new Date().toISOString(),
+    port: process.env.PORT || 8080
+  });
+});
+
+// Additional health check for load balancers
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "healthy" });
 });
 
 const server = http.createServer(app);
+
+// Enhanced Socket.IO configuration for deployment
 const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"],
+    credentials: true
   },
+  // Important: Configure transports for better compatibility
+  transports: ['websocket', 'polling'],
+  // Increase timeout values for production
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  // Allow HTTP long-polling fallback
+  allowEIO3: true,
+  // Configure for reverse proxy environments
+  allowUpgrades: true,
+  upgradeTimeout: 30000,
+  // Additional options for production stability
+  maxHttpBufferSize: 1e6,
+  serveClient: false
 });
 
 // Define sessions object to store session data
 const sessions = {};
 
 function handleDoctorPreview(socket) {
-  socket.send(
-    JSON.stringify({
-      type: "doctor_preview",
-      message: "Doctor is in preview mode.",
-    })
-  );
+  socket.emit("doctor_preview", {
+    type: "doctor_preview",
+    message: "Doctor is in preview mode.",
+  });
   console.log("Doctor is in preview mode:", socket.id);
 }
 
@@ -43,22 +72,19 @@ function handleDoctorJoin(socket, data) {
 
   const session = sessions[sessionId];
   session.doctor = { id: socket.id, socket };
-  socket.send(
-    JSON.stringify({
-      type: "doctor_joined",
-      message: "Doctor has joined the meeting.",
-    })
-  );
+
+  socket.emit("doctor_joined", {
+    type: "doctor_joined",
+    message: "Doctor has joined the meeting.",
+  });
 
   // Notify all patients in the waiting lobby
   session.patients.waitingLobby.forEach((patient) => {
-    socket.send(
-      JSON.stringify({
-        type: "patient_request",
-        patientId: patient.id,
-        username: patient.username,
-      })
-    );
+    socket.emit("patient_request", {
+      type: "patient_request",
+      patientId: patient.id,
+      username: patient.username,
+    });
   });
 
   console.log("Session after doctor join:", sessions);
@@ -79,24 +105,20 @@ function handlePatientJoin(socket, data) {
   }
 
   const session = sessions[sessionId];
-  session.patients.waitingLobby.push(patient); // Add to waiting lobby
+  session.patients.waitingLobby.push(patient);
 
-  socket.send(
-    JSON.stringify({
-      type: "waiting",
-      message: "Please wait in the lobby.",
-      patientId: patient.id,
-    })
-  );
+  socket.emit("waiting", {
+    type: "waiting",
+    message: "Please wait in the lobby.",
+    patientId: patient.id,
+  });
 
   if (session.doctor) {
-    session.doctor.socket.send(
-      JSON.stringify({
-        type: "patient_request",
-        patientId: patient.id,
-        username: patient.username,
-      })
-    );
+    session.doctor.socket.emit("patient_request", {
+      type: "patient_request",
+      patientId: patient.id,
+      username: patient.username,
+    });
   }
 
   console.log("Patient added to waitingLobby:", session.patients.waitingLobby);
@@ -110,16 +132,14 @@ function handlePatientApproval(socket, data) {
   if (session && session.doctor.id === socket.id) {
     const patient = session.patients.waitingLobby.find((client) => client.id === patientId);
     if (patient) {
-      patient.socket.send(
-        JSON.stringify({
-          type: "approved",
-          message: "You are approved to join the meeting.",
-          patientID: patientId,
-        })
-      );
+      patient.socket.emit("approved", {
+        type: "approved",
+        message: "You are approved to join the meeting.",
+        patientID: patientId,
+      });
 
       session.patients.waitingLobby = session.patients.waitingLobby.filter((client) => client.id !== patientId);
-      session.patients.joinedPatients.push(patient); // Move patient to joined patients
+      session.patients.joinedPatients.push(patient);
 
       console.log("Patient approved:", patient);
       console.log("Current joinedPatients:", session.patients.joinedPatients);
@@ -135,12 +155,10 @@ function handlePatientRejection(socket, data) {
   if (session && session.doctor.id === socket.id) {
     const patient = session.patients.waitingLobby.find((client) => client.id === patientId);
     if (patient) {
-      patient.socket.send(
-        JSON.stringify({
-          type: "rejected",
-          message: "You are not allowed to join the meeting.",
-        })
-      );
+      patient.socket.emit("rejected", {
+        type: "rejected",
+        message: "You are not allowed to join the meeting.",
+      });
 
       session.patients.waitingLobby = session.patients.waitingLobby.filter((client) => client.id !== patientId);
 
@@ -161,19 +179,17 @@ function handlePatientLeaveMeeting(socket, data) {
       session.patients.joinedPatients = session.patients.joinedPatients.filter((p) => p.id !== patientId);
 
       if (session.doctor) {
-        session.doctor.socket.send(
-          JSON.stringify({
-            type: "patient_leave",
-            message: "Patient left the meeting.",
-          })
-        );
+        session.doctor.socket.emit("patient_leave", {
+          type: "patient_leave",
+          message: "Patient left the meeting.",
+        });
       }
-      socket.send(
-        JSON.stringify({
-          type: "leave_confirmation",
-          message: "You have successfully left the meeting.",
-        })
-      );
+
+      socket.emit("leave_confirmation", {
+        type: "leave_confirmation",
+        message: "You have successfully left the meeting.",
+      });
+
       patient.socket.disconnect();
 
       console.log("Current joinedPatients after leave:", session.patients.joinedPatients);
@@ -191,24 +207,21 @@ function handlePatientJoinMeeting(socket, data) {
 
   if (session) {
     if (session.doctor) {
-      session.doctor.socket.send(
-        JSON.stringify({
-          type: "patient_joined",
-          message: `${patient.username} has joined the meeting.`,
-        })
-      );
+      session.doctor.socket.emit("patient_joined", {
+        type: "patient_joined",
+        message: `${patient.username} has joined the meeting.`,
+      });
     }
 
-    // Ensure that the patient is added to the session's joinedPatients list
     session.patients.joinedPatients.push(patient);
-    session.patients.waitingLobby = session.patients.waitingLobby.filter((p) => p.id !== patientId); // Remove from waitingLobby
+    session.patients.waitingLobby = session.patients.waitingLobby.filter((p) => p.id !== patientId);
+
     console.log("session===", session);
-    socket.send(
-      JSON.stringify({
-        type: "joined_meeting",
-        message: "You have successfully joined the meeting.",
-      })
-    );
+
+    socket.emit("joined_meeting", {
+      type: "joined_meeting",
+      message: "You have successfully joined the meeting.",
+    });
 
     console.log(`Patient ${patient.id} joined the meeting.`);
     console.log("Current joinedPatients:", session.patients.joinedPatients);
@@ -229,19 +242,19 @@ function handleDoctorEndMeeting(socket) {
 
     session.patients.joinedPatients.forEach((patient) => {
       if (patient.socket.connected) {
-        patient.socket.send(JSON.stringify(endMessage));
+        patient.socket.emit("doctor_end_meeting", endMessage);
         patient.socket.disconnect(true);
       }
     });
 
     session.patients.waitingLobby.forEach((patient) => {
       if (patient.socket.connected) {
-        patient.socket.send(JSON.stringify(endMessage));
+        patient.socket.emit("doctor_end_meeting", endMessage);
         patient.socket.disconnect(true);
       }
     });
 
-    session.doctor.socket.send(JSON.stringify(endMessage));
+    session.doctor.socket.emit("doctor_end_meeting", endMessage);
     session.doctor.socket.disconnect(true);
     delete sessions[sessionId];
 
@@ -249,16 +262,54 @@ function handleDoctorEndMeeting(socket) {
   }
 }
 
-io.on("connection", (socket) => {
-  console.log(`Socket connected: ${socket.id}`);
+// Cleanup function for disconnected clients
+function cleanupDisconnectedClient(socketId) {
+  Object.keys(sessions).forEach(sessionId => {
+    const session = sessions[sessionId];
 
-  socket.on("disconnect", (reason) => {
-    console.log(`Socket disconnected: ${socket.id}, Reason: ${reason}`);
+    // Remove from doctor
+    if (session.doctor && session.doctor.id === socketId) {
+      session.doctor = null;
+    }
+
+    // Remove from waiting lobby
+    session.patients.waitingLobby = session.patients.waitingLobby.filter(
+      patient => patient.id !== socketId
+    );
+
+    // Remove from joined patients
+    session.patients.joinedPatients = session.patients.joinedPatients.filter(
+      patient => patient.id !== socketId
+    );
+
+    // Clean up empty sessions
+    if (!session.doctor &&
+      session.patients.waitingLobby.length === 0 &&
+      session.patients.joinedPatients.length === 0) {
+      delete sessions[sessionId];
+    }
+  });
+}
+
+io.on("connection", (socket) => {
+  console.log(`Socket connected: ${socket.id} at ${new Date().toISOString()}`);
+
+  // Send connection confirmation
+  socket.emit("connected", {
+    message: "Successfully connected to WebSocket server",
+    socketId: socket.id,
+    timestamp: new Date().toISOString()
   });
 
+  socket.on("disconnect", (reason) => {
+    console.log(`Socket disconnected: ${socket.id}, Reason: ${reason} at ${new Date().toISOString()}`);
+    cleanupDisconnectedClient(socket.id);
+  });
+
+  // Handle both 'message' and individual event listeners
   socket.on("message", async (msg) => {
     try {
-      const data = JSON.parse(msg);
+      const data = typeof msg === 'string' ? JSON.parse(msg) : msg;
       console.log("Received message:", data);
 
       switch (data.type) {
@@ -288,17 +339,50 @@ io.on("connection", (socket) => {
           break;
         default:
           console.error("Unknown message type:", data);
+          socket.emit("error", { message: "Unknown message type", type: data.type });
       }
     } catch (error) {
       console.error("Error processing message:", error);
+      socket.emit("error", { message: "Error processing message", error: error.message });
     }
   });
+
+  // Add individual event listeners for better client compatibility
+  socket.on("preview_doctor", (data) => handleDoctorPreview(socket, data));
+  socket.on("join_meeting", (data) => {
+    if (data.role === 1) handleDoctorJoin(socket, data);
+  });
+  socket.on("waiting_lobby", (data) => {
+    if (data.role === 0) handlePatientJoin(socket, data);
+  });
+  socket.on("approve_patient", (data) => handlePatientApproval(socket, data));
+  socket.on("reject_patient", (data) => handlePatientRejection(socket, data));
+  socket.on("patient_leave_meeting", (data) => handlePatientLeaveMeeting(socket, data));
+  socket.on("doctor_end", (data) => handleDoctorEndMeeting(socket, data));
+  socket.on("patient_join_meeting", (data) => handlePatientJoinMeeting(socket, data));
 
   socket.on("error", (error) => {
     console.error("Socket.IO error:", error);
   });
+
+  // Handle ping/pong for connection health
+  socket.on("ping", () => {
+    socket.emit("pong", { timestamp: Date.now() });
+  });
 });
 
-server.listen(8080, () => {
-  console.log("Listening on *:8080");
+// Enhanced error handling
+io.engine.on("connection_error", (err) => {
+  console.log("Connection error details:", err.req);
+  console.log("Error code:", err.code);
+  console.log("Error message:", err.message);
+  console.log("Error context:", err.context);
+});
+
+// Use environment port or default to 8080
+const PORT = process.env.PORT || 8080;
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`WebSocket server listening on *:${PORT} at ${new Date().toISOString()}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
