@@ -71,14 +71,29 @@ function handleDoctorJoin(socket, data) {
   }
 
   const session = sessions[sessionId];
+
+  // Check if doctor is already assigned to this session
+  if (session.doctor && session.doctor.id === socket.id) {
+    console.log(`Doctor ${socket.id} is already assigned to session ${sessionId}`);
+    socket.emit("doctor_joined", {
+      type: "doctor_joined",
+      message: "You are already the doctor for this meeting.",
+    });
+    return;
+  }
+
+  // Assign doctor to session
   session.doctor = { id: socket.id, socket };
 
   socket.emit("doctor_joined", {
     type: "doctor_joined",
     message: "Doctor has joined the meeting.",
+    sessionId: sessionId,
+    waitingPatients: session.patients.waitingLobby.length,
+    joinedPatients: session.patients.joinedPatients.length
   });
 
-  // Notify all patients in the waiting lobby
+  // Notify doctor about all patients in the waiting lobby
   session.patients.waitingLobby.forEach((patient) => {
     socket.emit("patient_request", {
       type: "patient_request",
@@ -87,7 +102,9 @@ function handleDoctorJoin(socket, data) {
     });
   });
 
-  console.log("Session after doctor join:", sessions);
+  console.log(`Doctor ${socket.id} joined session ${sessionId}`);
+  console.log(`Patients in waiting lobby: ${session.patients.waitingLobby.length}`);
+  console.log(`Patients already joined: ${session.patients.joinedPatients.length}`);
 }
 
 function handlePatientJoin(socket, data) {
@@ -105,6 +122,31 @@ function handlePatientJoin(socket, data) {
   }
 
   const session = sessions[sessionId];
+
+  // Check if patient is already in waiting lobby or joined patients
+  const isAlreadyInWaiting = session.patients.waitingLobby.some(p => p.id === patient.id);
+  const isAlreadyJoined = session.patients.joinedPatients.some(p => p.id === patient.id);
+
+  if (isAlreadyInWaiting) {
+    console.log(`Patient ${patient.id} is already in waiting lobby`);
+    socket.emit("waiting", {
+      type: "waiting",
+      message: "You are already in the waiting lobby.",
+      patientId: patient.id,
+    });
+    return;
+  }
+
+  if (isAlreadyJoined) {
+    console.log(`Patient ${patient.id} is already in the meeting`);
+    socket.emit("joined_meeting", {
+      type: "joined_meeting",
+      message: "You are already in the meeting.",
+    });
+    return;
+  }
+
+  // Add patient to waiting lobby
   session.patients.waitingLobby.push(patient);
 
   socket.emit("waiting", {
@@ -113,15 +155,20 @@ function handlePatientJoin(socket, data) {
     patientId: patient.id,
   });
 
-  if (session.doctor) {
+  // Notify doctor if present
+  if (session.doctor && session.doctor.socket.connected) {
     session.doctor.socket.emit("patient_request", {
       type: "patient_request",
       patientId: patient.id,
       username: patient.username,
     });
+    console.log(`Notified doctor about patient request: ${patient.username}`);
+  } else {
+    console.log("No doctor available to notify about patient request");
   }
 
-  console.log("Patient added to waitingLobby:", session.patients.waitingLobby);
+  console.log(`Patient ${patient.username} (${patient.id}) added to waitingLobby for session ${sessionId}`);
+  console.log(`Current waiting lobby size: ${session.patients.waitingLobby.length}`);
 }
 
 function handlePatientApproval(socket, data) {
@@ -129,22 +176,58 @@ function handlePatientApproval(socket, data) {
   const patientId = data.patientID;
   const session = sessions[sessionId];
 
-  if (session && session.doctor.id === socket.id) {
-    const patient = session.patients.waitingLobby.find((client) => client.id === patientId);
-    if (patient) {
-      patient.socket.emit("approved", {
-        type: "approved",
-        message: "You are approved to join the meeting.",
-        patientID: patientId,
-      });
+  console.log(`Doctor ${socket.id} attempting to approve patient ${patientId} in session ${sessionId}`);
 
-      session.patients.waitingLobby = session.patients.waitingLobby.filter((client) => client.id !== patientId);
-      session.patients.joinedPatients.push(patient);
-
-      console.log("Patient approved:", patient);
-      console.log("Current joinedPatients:", session.patients.joinedPatients);
-    }
+  if (!session) {
+    console.log(`Session ${sessionId} not found`);
+    socket.emit("error", { message: "Session not found" });
+    return;
   }
+
+  if (!session.doctor || session.doctor.id !== socket.id) {
+    console.log(`Unauthorized approval attempt by ${socket.id} for session ${sessionId}`);
+    socket.emit("error", { message: "Unauthorized: Only the doctor can approve patients" });
+    return;
+  }
+
+  const patient = session.patients.waitingLobby.find((client) => client.id === patientId);
+
+  if (!patient) {
+    console.log(`Patient ${patientId} not found in waiting lobby`);
+    socket.emit("error", { message: "Patient not found in waiting lobby" });
+    return;
+  }
+
+  // Check if patient socket is still connected
+  if (!patient.socket.connected) {
+    console.log(`Patient ${patientId} socket is disconnected, removing from lobby`);
+    session.patients.waitingLobby = session.patients.waitingLobby.filter((client) => client.id !== patientId);
+    return;
+  }
+
+  // Approve the patient
+  patient.socket.emit("approved", {
+    type: "approved",
+    message: "You are approved to join the meeting.",
+    patientID: patientId,
+    sessionID: sessionId
+  });
+
+  // Move patient from waiting lobby to joined patients
+  session.patients.waitingLobby = session.patients.waitingLobby.filter((client) => client.id !== patientId);
+  session.patients.joinedPatients.push(patient);
+
+  // Confirm to doctor
+  socket.emit("patient_approved", {
+    type: "patient_approved",
+    message: `Patient ${patient.username} has been approved`,
+    patientId: patientId,
+    patientUsername: patient.username
+  });
+
+  console.log(`Patient ${patient.username} (${patientId}) approved and moved to joined patients`);
+  console.log(`Current waiting lobby: ${session.patients.waitingLobby.length} patients`);
+  console.log(`Current joined patients: ${session.patients.joinedPatients.length} patients`);
 }
 
 function handlePatientRejection(socket, data) {
